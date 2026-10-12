@@ -302,8 +302,13 @@ func (g *grpcExecutor) executeActivityAsync(ctx context.Context, iid api.Instanc
 		PropagatedHistory:  opts.PropagatedHistory,
 	}
 	// Same stale-response guard as executeWorkflowAsync: a mismatched token
-	// is a superseded dispatch's response and must not settle this one.
-	token := uuid.NewString()
+	// is another scheduling's response and must not settle this one. The
+	// token identifies the scheduling, not the dispatch attempt, so the
+	// response of an earlier attempt of the same TaskScheduled event (its
+	// host died, or its stream dropped, before the response came back)
+	// settles the re-dispatch instead of being discarded; see
+	// activityCompletionToken.
+	token := activityCompletionToken(e)
 	workItem := &protos.WorkItem{
 		Request: &protos.WorkItem_ActivityRequest{
 			ActivityRequest: req,
@@ -430,6 +435,30 @@ func activityResponseEvent(e *protos.HistoryEvent, task *protos.TaskScheduledEve
 		},
 		Router: e.Router,
 	}
+}
+
+// activityCompletionToken returns the completion token of an activity
+// dispatch. It is a function of the scheduling, not of the dispatch attempt:
+// every dispatch of one TaskScheduled event (a retry of its run-activity
+// reminder, a re-dispatch by the next host after a crash, a janitor
+// re-dispatch) carries the same token, so the response of an earlier attempt
+// settles the task and the current attempt's own execution is not waited
+// for. A later scheduling that re-uses the task ID under the same instance
+// ID (an instance recreated under the same ID, a continued-as-new
+// generation) carries another TaskExecutionId, or another timestamp when
+// the SDK predates TaskExecutionId, so its token differs and the
+// stale-response guard discards the earlier scheduling's response as
+// before. An event with neither keeps a fresh token per dispatch.
+func activityCompletionToken(e *protos.HistoryEvent) string {
+	id := e.GetTaskScheduled().GetTaskExecutionId()
+	stamp := e.GetTimestamp()
+	if id == "" && stamp == nil {
+		return uuid.NewString()
+	}
+	if stamp == nil {
+		return id
+	}
+	return id + "@" + strconv.FormatInt(stamp.GetSeconds(), 10) + "." + strconv.FormatInt(int64(stamp.GetNanos()), 10)
 }
 
 // Shutdown implements Executor
