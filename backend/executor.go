@@ -307,8 +307,8 @@ func (g *grpcExecutor) executeActivityAsync(ctx context.Context, iid api.Instanc
 	// response of an earlier attempt of the same TaskScheduled event (its
 	// host died, or its stream dropped, before the response came back)
 	// settles the re-dispatch instead of being discarded; see
-	// activityCompletionToken.
-	token := activityCompletionToken(e)
+	// ActivitySchedulingID.
+	token := ActivitySchedulingID(e)
 	workItem := &protos.WorkItem{
 		Request: &protos.WorkItem_ActivityRequest{
 			ActivityRequest: req,
@@ -320,7 +320,7 @@ func (g *grpcExecutor) executeActivityAsync(ctx context.Context, iid api.Instanc
 	var untrack func()
 	deliver := func(resp *protos.ActivityResponse, err error) {
 		if err == nil && resp.GetCompletionToken() != "" && resp.GetCompletionToken() != token {
-			g.logger.Warnf("%s/%s#%d: discarding stale activity response (completion token mismatch); waiting for the current dispatch's response", iid, task.Name, e.EventId)
+			g.logger.Warnf("%s/%s#%d: discarding activity response from another scheduling (completion token mismatch)", iid, task.Name, e.EventId)
 			// Registration stays armed; see the workflow deliver above.
 			return
 		}
@@ -437,28 +437,33 @@ func activityResponseEvent(e *protos.HistoryEvent, task *protos.TaskScheduledEve
 	}
 }
 
-// activityCompletionToken returns the completion token of an activity
-// dispatch. It is a function of the scheduling, not of the dispatch attempt:
-// every dispatch of one TaskScheduled event (a retry of its run-activity
-// reminder, a re-dispatch by the next host after a crash, a janitor
-// re-dispatch) carries the same token, so the response of an earlier attempt
-// settles the task and the current attempt's own execution is not waited
-// for. A later scheduling that re-uses the task ID under the same instance
-// ID (an instance recreated under the same ID, a continued-as-new
-// generation) carries another TaskExecutionId, or another timestamp when
-// the SDK predates TaskExecutionId, so its token differs and the
-// stale-response guard discards the earlier scheduling's response as
-// before. An event with neither keeps a fresh token per dispatch.
-func activityCompletionToken(e *protos.HistoryEvent) string {
-	id := e.GetTaskScheduled().GetTaskExecutionId()
+// ActivitySchedulingID returns the identity of one scheduling of an activity,
+// that is, of one TaskScheduled event. The executor uses it as the completion
+// token of an activity dispatch. It is a function of the scheduling, not of
+// the dispatch attempt: every dispatch of one TaskScheduled event (a retry of
+// its run-activity reminder, a re-dispatch by the next host after a crash, a
+// janitor re-dispatch) carries the same token, so the response of an earlier
+// attempt settles the task and the current attempt's own execution is not
+// waited for. A later scheduling that re-uses the task ID under the same
+// instance ID (an instance recreated under the same ID, a continued-as-new
+// generation) carries another TaskExecutionId, or another timestamp when the
+// SDK predates TaskExecutionId, so its token differs and the stale-response
+// guard discards the earlier scheduling's response as before.
+//
+// A rerun copies the source run's execution ID and TaskExecutionId, so the
+// timestamp, which the rerun resets, is the field that separates two reruns
+// into the same instance ID.
+//
+// An event without a timestamp gets a new UUID on each call. The
+// TaskExecutionId alone does not identify a run, because a rerun copies it.
+// The runtime state applier sets a timestamp on every TaskScheduled event
+// that it creates.
+func ActivitySchedulingID(e *protos.HistoryEvent) string {
 	stamp := e.GetTimestamp()
-	if id == "" && stamp == nil {
+	if stamp == nil {
 		return uuid.NewString()
 	}
-	if stamp == nil {
-		return id
-	}
-	return id + "@" + strconv.FormatInt(stamp.GetSeconds(), 10) + "." + strconv.FormatInt(int64(stamp.GetNanos()), 10)
+	return e.GetTaskScheduled().GetTaskExecutionId() + "@" + strconv.FormatInt(stamp.GetSeconds(), 10) + "." + strconv.FormatInt(int64(stamp.GetNanos()), 10)
 }
 
 // Shutdown implements Executor
